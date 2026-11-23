@@ -154,7 +154,8 @@ if ($proc.StandardError.Peek() -ge 0) {
 }
 $proc.StandardInput.Close()
 
-$canonicalJson = $proc.StandardOutput.ReadToEnd()$proc.WaitForExit()
+$canonicalJson = $proc.StandardOutput.ReadToEnd()
+$proc.WaitForExit()
 Write-Output "Result (Exit $($proc.ExitCode)):$canonicalJson"
 ```
 

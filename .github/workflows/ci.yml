@@ -1,41 +1,159 @@
-name: Build and Test Hydration
+name: Build, Audit & Test (Windows Static PE32+)
 
 on:
   push:
     branches: [main, master]
+    tags: ["v*"]
   pull_request:
     branches: [main, master]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
-  windows-build-and-test:
+  build-and-verify:
+    name: MinGW-w64 Static Build & Verification
     runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Configure CMake
-        shell: pwsh
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Set up MinGW-w64 toolchain
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-make
+            mingw-w64-x86_64-binutils
 
-      - name: Build Release binary
-        shell: pwsh
-        run: cmake --build build --config Release
-
-      - name: Locate hydration.exe
-        shell: pwsh
+      - name: Configure and build static Release binaries
         run: |
-          $built = Get-ChildItem -Path "$PWD\build" -Filter "hydration.exe" -Recurse | Select-Object -First 1
-          if (-not $built) {
-            throw "hydration.exe was not produced by the build."
-          }
-          $rootExe = Join-Path $PWD "hydration.exe"
-          if ($built.FullName -ne $rootExe) {
-            Copy-Item -Path $built.FullName -Destination $rootExe -Force
-          }
-          Write-Host "Using executable: $rootExe"
+          cmake -S . -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release --parallel
 
-      - name: Run test suite
-        shell: pwsh
-        run: .\tests.ps1
+          # Copy built binaries to repo root if CMake placed them inside build/
+          foreach ($bin in @("hydration.exe", "test_validator.exe")) {
+            if (-not (Test-Path ".\$bin") -and (Test-Path ".\build\$bin")) {
+              Copy-Item ".\build\$bin" ".\$bin" -Force
+            }
+            if (-not (Test-Path ".\$bin")) {
+              throw "Expected release binary missing: $bin"
+            }
+          }
+
+          Get-Item .\hydration.exe, .\test_validator.exe |
+            Select-Object Name, Length, @{N='SizeKB';E={[Math]::Round($_.Length/1KB, 2)}} |
+            Format-Table -AutoSize
+
+      - name: Audit PE import tables (zero external MinGW DLLs)
+        run: |
+          $forbidden = @("libstdc++", "libgcc_s", "libwinpthread", "msvcrt.dll")
+          foreach ($bin in @("hydration.exe", "test_validator.exe")) {
+            Write-Host "=== PE DLL Imports: $bin ===" -ForegroundColor Cyan
+            $dllLines = objdump -p ".\$bin" | Select-String "DLL Name:"
+            $dllLines | ForEach-Object { Write-Host $_.Line.Trim() }
+
+            foreach ($bad in $forbidden) {
+              if ($dllLines -match [regex]::Escape($bad)) {
+                throw "PE audit failed: $bin links against forbidden external/legacy DLL matching '$bad'"
+              }
+            }
+          }
+
+          if (Test-Path .\kernel_rw.ps1) {
+            .\kernel_rw.ps1
+            .\kernel_rw.ps1 -BinaryPath ".\test_validator.exe"
+          }
+
+      - name: Verify System32-only PATH isolation
+        run: |
+          $origPath = $env:PATH
+          try {
+            $env:PATH = "$env:SystemRoot\System32"
+            $ver = & .\hydration.exe --version
+            if ($LASTEXITCODE -ne 0) {
+              throw "hydration.exe --version failed under System32-only PATH (ExitCode=$LASTEXITCODE)"
+            }
+            Write-Host "System32-only PATH check passed: $ver" -ForegroundColor Green
+          } finally {
+            $env:PATH = $origPath
+          }
+
+      - name: Run end-to-end functional and edge-case suite (test.ps1)
+        run: |
+          .\test.ps1
+
+      - name: Verify README.md consistency & live CLI examples
+        if: hashFiles('README.md') != ''
+        run: |
+          $readme = Get-Content .\README.md -Raw
+
+          # 1. Ensure C++ standard in README matches CMakeLists.txt (C++20)
+          if (Test-Path .\CMakeLists.txt) {
+            $cmake = Get-Content .\CMakeLists.txt -Raw
+            if ($cmake -match 'CXX_STANDARD\s+20' -and $readme -notmatch 'C\+\+20') {
+              throw "README.md does not reflect C++20 configured in CMakeLists.txt"
+            }
+          }
+
+          # 2. Verify every documented CLI flag is recognized without unknown-flag errors
+          $documentedFlags = @("--pretty", "--child", "--no-parent", "--handshake", "--acknowledge", "--validator", "--version")
+          foreach ($flag in $documentedFlags) {
+            if ($readme -notmatch [regex]::Escape($flag)) {
+              throw "Documented flag missing from README.md: $flag"
+            }
+          }
+
+          # 3. Smoke-test README Example 1 (Unicode normalization & warm cache roundtrip)
+          $tmpCache = Join-Path $env:TEMP ("readme_smoke_" + [guid]::NewGuid().ToString("N") + ".json")
+          try {
+            $out1 = '["  CAFÉ  ", "café", "Alpha\u200B", "   ", "Beta   Gamma"]' | & .\hydration.exe "@$tmpCache"
+            if ($LASTEXITCODE -ne 0 -or $out1.Trim() -ne '["café","alpha","beta gamma"]') {
+              throw "README Example 1 cold-ingest mismatch: got '$out1' (ExitCode=$LASTEXITCODE)"
+            }
+
+            $out2 = & .\hydration.exe "@$tmpCache"
+            if ($LASTEXITCODE -ne 0 -or $out2.Trim() -ne '["café","alpha","beta gamma"]') {
+              throw "README Example 1 warm-cache mismatch: got '$out2' (ExitCode=$LASTEXITCODE)"
+            }
+            Write-Host "README.md consistency and live CLI examples verified." -ForegroundColor Green
+          } finally {
+            Remove-Item $tmpCache -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Run smoke benchmark against bench_baseline.json
+        if: hashFiles('bench_baseline.json') != '' && hashFiles('benchmark.ps1') != ''
+        run: |
+          .\benchmark.ps1 -Iterations 3 -Warmup 1 -CompareBaseline
+
+      - name: Generate SHA256SUMS.txt
+        run: |
+          $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+          $lines = foreach ($f in @("hydration.exe", "test_validator.exe")) {
+            $h = (Get-FileHash -Path ".\$f" -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$h  $f"
+          }
+          [System.IO.File]::WriteAllText(
+            (Join-Path (Get-Location) "SHA256SUMS.txt"),
+            ($lines -join "`n") + "`n",
+            $utf8NoBom
+          )
+          Get-Content .\SHA256SUMS.txt
+
+      - name: Upload standalone binaries and checksums
+        uses: actions/upload-artifact@v4
+        with:
+          name: hydration-windows-x64-static
+          path: |
+            hydration.exe
+            test_validator.exe
+            SHA256SUMS.txt
+          if-no-files-found: error
