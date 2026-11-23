@@ -13,6 +13,8 @@ Compiled as a single, self-contained Windows PE32+ executable (`-O3 -fno-excepti
 * **Atomic Crash-Safe Cache Persistence:** Writes updated cache payloads to a temporary file in the target directory and atomically swaps it into place (`MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`), ensuring readers never observe half-written or truncated JSON files.
 * **Supervisor & Pipeline Integration:** Automatically adapts its I/O protocol depending on whether it is invoked interactively by a user, chained in a shell pipe, or spawned as a managed worker by a parent orchestrator.
 * **Pluggable External Validation (`--validator`):** Delegates domain-specific schema or business-rule validation to any external executable or script (`.exe`, `.ps1`, `.cmd`, `.bat`) over standard I/O pipes.
+* **HTML-to-JSON AST Conversion & Roundtrip Serialization:** Parses raw HTML markup into a structured JSON Abstract Syntax Tree (element tags, attributes, text nodes, comments, and void-element awareness) and serializes JSON AST nodes back into valid HTML markup with roundtrip fidelity.
+* **Cache-Backed AST Memoization:** Stores parsed HTML-to-JSON AST representations atomically in `@<file>` caches so repeated downstream queries or reverse HTML renders bypass re-parsing overhead.
 
 ---
 
@@ -70,6 +72,71 @@ Internally, `hydration` avoids C++ exceptions, RTTI, and third-party libraries i
 ---
 
 ## Strict JSON vs. Custom `--validator` Protocol
+
+## HTML ↔ JSON AST Conversion & Roundtrip Pipeline
+
+Alongside strict RFC 8259 string-array caching, `hydration` (and custom AST validator/transformer pipelines) supports deterministic bidirectional conversion between raw HTML documents/fragments and structured JSON Abstract Syntax Trees (ASTs):
+
+### 1. HTML → JSON AST Schema
+
+Raw HTML input is tokenized into a tree of typed JSON nodes preserving document hierarchy, attribute key-value maps, text content, and self-closing/void elements (`<img>`, `<br>`, `<meta>`, `<input>`, `<hr>`, `<link>`):
+
+```json
+{
+  "type": "element",
+  "tag": "div",
+  "attributes": {
+    "class": "card",
+    "data-id": "42"
+  },
+  "children": [
+    {
+      "type": "element",
+      "tag": "h2",
+      "attributes": {},
+      "children": [
+        { "type": "text", "value": "Hello, World" }
+      ]
+    },
+    {
+      "type": "element",
+      "tag": "br",
+      "void": true,
+      "attributes": {},
+      "children": []
+    }
+  ]
+}
+```
+
+---
+
+### Additional Example Use Cases (Add to `## Example Use Cases`)
+
+```markdown
+### 5. Converting HTML to a Cached JSON AST and Back to HTML
+
+Use a custom `--validator` (or AST pipeline script) with `@<file>` to parse raw HTML into a cached JSON AST once, inspect or transform the tree, and reconstruct HTML back from the cached AST:
+
+```powershell
+# 1. Convert raw HTML into a JSON AST and cache it atomically in @dom_ast.json
+$html = '<section id="main"><p class="lead">Fast <strong>zero-dependency</strong> caching.</p></section>'
+
+# Pipe HTML through an HTML-to-JSON AST converter and persist via hydration
+$astJson = $html \vert{} .\html_to_ast.ps1$astJson | .\hydration.exe "@dom_ast.json" --validator=@validate_ast.ps1 --pretty
+
+# 2. Read the cached JSON AST on subsequent runs without re-parsing HTML
+.\hydration.exe "@dom_ast.json" --validator=@validate_ast.ps1
+
+# 3. Serialize the cached JSON AST back into HTML markup (roundtrip)
+.\hydration.exe "@dom_ast.json" --validator=@validate_ast.ps1 | .\ast_to_html.ps1
+# stdout: <section id="main"><p class="lead">Fast <strong>zero-dependency</strong> caching.</p></section>
+```
+
+<ElicitationsGroup message="Would you like to build out the AST tooling or commit the docs?">
+  <Elicitation label="Output the full merged README.md with the HTML ↔ JSON AST sections included" query="Output the complete README.md combining all previous sections with the new HTML-to-JSON AST conversion and roundtrip documentation."/>
+  <Elicitation label="Write C++17 zero-dependency HTML-to-JSON AST and JSON-AST-to-HTML roundtrip helpers" query="Write zero-dependency C++17 functions for converting HTML to a JSON AST and serializing the JSON AST back to HTML with roundtrip validation."/>
+</ElicitationsGroup>
 
 ### Default Validation & Normalization Pipeline (No `--validator`)
 
