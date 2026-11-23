@@ -1,0 +1,41 @@
+name: Build and Test Hydration
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  windows-build-and-test:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure CMake
+        shell: pwsh
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build Release binary
+        shell: pwsh
+        run: cmake --build build --config Release
+
+      - name: Locate hydration.exe
+        shell: pwsh
+        run: |
+          $built = Get-ChildItem -Path "$PWD\build" -Filter "hydration.exe" -Recurse | Select-Object -First 1
+          if (-not $built) {
+            throw "hydration.exe was not produced by the build."
+          }
+          $rootExe = Join-Path $PWD "hydration.exe"
+          if ($built.FullName -ne $rootExe) {
+            Copy-Item -Path $built.FullName -Destination $rootExe -Force
+          }
+          Write-Host "Using executable: $rootExe"
+
+      - name: Run test suite
+        shell: pwsh
+        run: .\tests.ps1
